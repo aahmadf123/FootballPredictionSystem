@@ -1,0 +1,49 @@
+app:
+  port: 8787
+  data_dir: ./data
+  leagues: [NFL, NCAA]
+  model_version_pin: null
+
+data:
+  update_intervals:
+    stats: "0 6 * * 2"
+    news: "*/60 * * * *"
+    weather: "0 */6 * * *"
+
+features:
+  windows: [1, 3, 5]
+  opponent_adjust: true
+  enable_player_level: true
+  enable_special_teams: true
+  enable_garbage_time_filter: true
+  garbage_time_thresholds:
+    nfl: {q1: 28, q2: 28, q3: 21, q4: 17}
+    ncaa: {q1: 35, q2: 35, q3: 28, q4: 24}
+  leverage_smoothing_alpha: 0.3
+
+models:
+  use_text: true
+  use_gnn: false
+  pbp_transformer:
+    enabled: true
+    d_model: 256
+    layers: 3
+    heads: 8
+    seq_len: 200
+  calibrator: "isotonic"
+  drl:
+    enabled: true
+    max_adjust_pct: 0.08
+    algo: "ppo"
+
+uncertainty:
+  deep_ensembles: 5
+  conformal:
+    levels: [0.8, 0.9]
+
+serving:
+  onnx: true
+  batch_cache: true
+
+privacy:
+  telemetry_opt_in: false
