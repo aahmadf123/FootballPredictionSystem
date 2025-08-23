@@ -1,0 +1,552 @@
+
+
+# 0) Scope & Principles
+
+**Goal**: Local-first, real-time, explainable football analytics for NFL + FBS—team/unit/player; offense/defense/**special teams**; season/game/**in-game**.
+
+**Non-goals**: Betting picks, hosted SaaS, opaque models.
+
+**Tenets**: Hybrid ML (DL + RL + Bayesian + transformers), rigorous calibration + **uncertainty**, transparent explanations, reproducible snapshots, plugin-extensible, analyst-friendly.
+
+---
+
+# 1) System Architecture
+
+**Data plane**: Connectors → Normalizers → **Feature Store (versioned)** → Snapshots.
+**Model plane**: Elo/SRS → DL tabular → (opt) GNN → PBP Transformer → Text/RAG → Meta-ensemble → Bayesian update → DRL weighter → **Calibration + Conformal**.
+**Serving plane**: FastAPI (localhost) → ONNX runtime → SHAP/Explanations → Streamlit/React UI + Notebook integration.
+**Automation**: APScheduler, idempotent jobs, retries, circuit-breaker.
+**Governance**: Rolling time-split CV, **A/B for features + models**, promotion gates, model cards, lineage.
+
+---
+
+# 2) Data Sources & Connectors (spec)
+
+## 2.1 Structured (pull, no manual scraping)
+
+* NFL: schedules, boxscores, **play-by-play (PBP)**, rosters.
+* NCAA FBS: same parity as NFL (PBP where available).
+* Player register: ID, team, position, depth, snaps.
+* **Special teams**: FG attempts/makes with distance; punts (hang time, net); kick/punt returns; blocks.
+* Ratings: your Elo/SRS; (optional) licensed power ratings.
+* **Recruiting** (college): team composite talent per season; class ranks.
+* **Transfer portal**: in/out players, previous school, projected role.
+* **Ref crews**: crew ID, historical penalty rate/variance, game pace.
+* Rule changes: season-level flags.
+
+## 2.2 Contextual
+
+* Injuries/transactions/depth charts (structured).
+* Weather: forecast and historical; wind/temp/precip; dome/outdoor.
+* Venue & travel: timezone delta, distance, **short week** flags, altitude.
+
+## 2.3 Unstructured
+
+* News/RSS: fetch → dedupe → NER (teams/players/coaches) → summarize → **impact flags** (e.g., “QB out”, “OL shuffle”, “OC scheme shift”).
+* (Optional) social sentiment: filtered; capped weight.
+
+## 2.4 Market (benchmark only)
+
+* Implied win probability (for calibration comparison, not target).
+
+## 2.5 Connector behavior
+
+* Every source = job: `fetch_raw → validate → normalize → upsert`.
+* Caching via `If-Modified-Since` / ETag; exponential backoff; typed validation.
+* **In-game** polling job for live score/PBP (if enabled).
+
+---
+
+# 3) Storage & Schemas
+
+**Files**: Parquet (bronze/silver/gold), JSON raw, SQLite metadata; DuckDB for ad-hoc.
+
+```
+data/
+  raw/<source>/<date>/*.json
+  bronze/*.parquet
+  silver/*.parquet
+  gold/feature_store/<feature_version_id>/*.parquet
+snapshots/packs/<season_week>/
+```
+
+## 3.1 Core silver tables (column : type)
+
+* `teams(team_id:str, league:str, conf:str, division:str, venue_id:str, tz:str, altitude:int, surface:str, coach_id:str, season:int)`
+* `coaches(coach_id:str, name:str, role:str, tenure:int, agg_4th:float, motion_rate:float, pa_rate:float, blitz_rate:float, season:int)`
+* `players(player_id:str, team_id:str, pos:str, depth:int, height:int, weight:int, age:float, snaps:int, season:int)`
+* `games(game_id:str, league:str, season:int, week:int, home_id:str, away_id:str, kickoff_utc:ts, venue_id:str, ref_crew_id:str, weather_id:str, line_implied:float, total_implied:float, home_score:int, away_score:int, status:str)`
+* `pbp(game_id:str, play_id:int, sec_left:int, quarter:int, down:int, dist:int, yardline_100:int, offense_id:str, defense_id:str, play_type:str, yards:int, ep_before:float, ep_after:float, epa:float, wpa:float)`
+* `injuries(game_id:str, player_id:str, status:str, designation:str, note:str, impact:int, as_of:ts)`
+* `special_teams(game_id:str, team_id:str, fg_att:int, fg_made:int, fg_dist_bins:json, punt_net_avg:float, pr_ypa:float, kr_ypa:float, blocks:int)`
+* `recruiting(team_id:str, season:int, composite_talent:float, class_rank:int)`
+* `transfer(team_id:str, season:int, player_id:str, direction:str, prev_team:str, proj_role:str)`
+* `ref_crews(ref_crew_id:str, season:int, penalties_per_game:float, std:float, pace_adj:float)`
+* `news(news_id:str, published_at:ts, url:str, team_ids:json, player_ids:json, coach_ids:json, summary:str, impact:json, sentiment:float)`
+* `situations(game_id:str, play_id:int, is_garbage_time:bool, leverage:float)`
+* `calibration(pred_id:str, game_id:str, p_hat:float, y:int, bucket:int, model_version:str, created_at:ts)`
+
+**Indices**: `(league,season,week)`, `(game_id)`, `(player_id,season)`, `(team_id,season)`.
+
+---
+
+# 4) Feature Engineering (gold)
+
+## 4.1 Team/unit form (baseline, filtered)
+
+* Compute **garbage time**: configurable (defaults below).
+
+  * Q1–Q2: lead ≥ 28; Q3: ≥ 21; Q4: ≥ 17 (NFL).
+  * NCAA defaults: +7 points to each threshold.
+  * Flag `situations.is_garbage_time`; exclude for “core” efficiency features; include for separate “close/neutral” splits.
+* Rolling windows (1/3/5 games): EPA/play, success rate, explosive play %, pressure allowed, rush/pass rate, pace (sec/snap), early-down pass rate, red-zone TD rate.
+* Opponent adjustment: ridge on schedule matrix (SRS) + Elo deltas.
+
+## 4.2 Player-level
+
+* **PlayerEPA/play** by involvement (QB dropbacks, RB carries/targets, WR/TE targets, OL pass-pro proxy via team pressure rate allowed over expected).
+* **Matchups**:
+
+  * WR vs CB: similarity (height/speed archetype) + coverage type propensity; feature = expected separation proxy (if no tracking, infer via target depth + scheme news).
+  * OL vs DL: pressure rate allowed vs generated; **win-rate proxy** = pressure rate over expected controlling for opponent & time-to-throw.
+* **Aging/development** (college): position-specific curves via hierarchical GAM or spline on age/class; parameter `dev_alpha_pos` shrinkage to team mean.
+
+## 4.3 Special teams
+
+* **FG make probability**: logistic `σ(β0 + β1*distance + β2*wind + β3*temp + β4*precip + β5*hash_mark)`; calibrate with isotonic.
+* **Return efficiency**: expected YPA by opponent coverage strength; feature = actual-expected.
+* **ST-EPA**: FG EPA + punt EPA (net field pos) + return EPA − block risk.
+
+## 4.4 Situational context
+
+* **Leverage index**: `LI = |∂WP/∂yards|` around current state (approx via small Δ yards).
+* **Momentum proxies** (bounded): smoothed ΔWP (EWMA), consecutive scoring drives, success-rate run (cap contribution to avoid ghosts).
+
+## 4.5 Advanced analytics
+
+* **Success rate by down/distance bins**: 1st-and-10 gain ≥ 50% ytg; 2nd ≥ 70%; 3rd/4th ≥ 100%.
+* **Havoc rate**: (TFL + FF + INT + PD)/defensive plays.
+* **Coverage scheme**: from PBP tags if available; else from CV module (optional).
+
+## 4.6 Recruiting/talent & portal
+
+* `team_talent_z = zscore(composite_talent_by_season)`.
+* `portal_net = Σ incoming impact − Σ outgoing impact` (impact from player EPA prior \* role weight).
+
+## 4.7 Weather/travel/ref
+
+* Weather bins; wind≥12mph flag.
+* Travel distance/time-zone; short week (Thu games) flag; international venue flag.
+* `ref_bias` = standardized dev from league penalty mean; `pace_adj`.
+
+## 4.8 Encoding & versioning
+
+* Categorical embeddings: team/opponent/coach/player/coverage.
+* Numeric standardization; outlier clip; learned imputations.
+* **feature\_version\_id** frozen per weekly pack.
+
+---
+
+# 5) Modeling Stack
+
+## 5.1 Baselines
+
+* **Elo logistic** (K tuned per league), home-field prior; recency decay.
+* **GBDT** on compact features as robust interpretable baseline.
+
+## 5.2 DL Tabular (primary)
+
+* Inputs: numeric blocks + embeddings (team, opp, coach, key players).
+* Architecture: 3–5 GRN (gated residual) blocks + dropout; multi-task heads: `(win_prob, margin_mu, totals_mu, aleatoric_var)`.
+* Loss: `λ1*BCE + λ2*Huber(margin) + λ3*MSE(totals) + λ4*NLL(aleatoric)`.
+
+## 5.3 PBP Transformer (sequence)
+
+* Tokens per play: one-hot(play\_type), down, dist, yardline, score diff, time, **state encodings**; (opt) learned drive boundary token.
+* Encoder: 2–4 layers, 8 heads, d\_model=128/256; masking by quarter.
+* Pretrain tasks: next-play type, success, EPA regression.
+* Game featurization: attention-pool last N plays & drives → vector fed to meta-ensemble.
+
+## 5.4 GNN (optional)
+
+* Nodes: teams (or units); edges: current week matchups; node feats: rolling metrics.
+* 2-layer GraphSAGE → logits; blend with tabular.
+
+## 5.5 Text/RAG encoder
+
+* Sentence-transformer (small) on news summaries → 128-d impact vector; per team/week; L2-clipped.
+
+## 5.6 Meta-Ensemble (constrained)
+
+* Inputs: `[elo_logit, gbdt_logit, dl_tab_logit, gnn_logit?, pbp_embed]` → ridge/logit with **non-neg weights summing to 1**.
+* Prevents overfitting: simplex constraint + time-split CV.
+
+## 5.7 Bayesian weekly update
+
+* State-space on team strength & coach impact: `θ_t = ρ*θ_{t−1} + ε`; posterior updates form priors for margin.
+
+## 5.8 DRL “weighter”
+
+* **State**: ensemble logits + late signals (inj/OL shuffle/weather/ref flags/momentum).
+* **Action**: Δweights (bounded ±8pp) or Δp\_hat (±5pp).
+* **Algorithm**: PPO (small MLP policy), reward = next-week −logloss; safety clamps; offline A/B before enable.
+
+## 5.9 Uncertainty + Calibration + Conformal
+
+* **Epistemic**: deep ensembles (K=5) or MC-dropout.
+* **Aleatoric**: variance head from DL.
+* **Calibration**: isotonic (primary) or temperature scaling on OOT folds; monitor **Brier**, **ECE**, sharpness.
+* **Split Conformal** (coverage):
+
+  1. Split calibration set;
+  2. Collect non-conformity scores (|y−ŷ| for regression; probability miscoverage for classification);
+  3. Set quantile `q=⌈(n+1)*(1−α)⌉/n`;
+  4. Output intervals \[μ−q, μ+q] (margin) or probability bands.
+* Guarantee: finite-sample (1−α) coverage under exchangeability.
+
+---
+
+# 6) Training & Evaluation
+
+## 6.1 Splits
+
+* Rolling time-series: train 2018–2022, val 2023 W1–W9, test 2023 W10–2024, then slide.
+* College: **conference-aware** folds; FCS excluded or separate head.
+
+## 6.2 Metrics (promote by these)
+
+* Primary: **LogLoss**, **Brier**, **ECE (≤0.03)**, **Conformal coverage** @ 80/90% (±2% tolerance).
+* Secondary: AUC, accuracy, margin RMSE, calibration sharpness.
+
+## 6.3 Tuning
+
+* `optuna` for DL/GBDT; early stopping on LogLoss; ensemble weight search under simplex.
+
+## 6.4 Benchmarks (POC must include)
+
+* Compare vs Elo baseline, **ESPN-style FPI proxy**, **538-style Elo proxy** (re-created features).
+* Record deltas with confidence intervals.
+
+## 6.5 Stress tests
+
+* Blowouts, extreme weather bins, Thursday & international games, rule-change seasons.
+
+---
+
+# 7) Inference & Update Pipeline
+
+## 7.1 Jobs (APScheduler)
+
+* `update_stats_daily` (in-season: hourly PBP), `update_news_hourly`, `update_weather_6h`,
+  `recompute_features_on_delta`, `predict_weekly Tue 06:00`, `recalibrate_weekly Tue 06:15`.
+
+## 7.2 Flow
+
+1. Fetch/normalize/upsert.
+2. Rebuild affected features (**real-time capable**): player, ST, weather, injuries, momentum.
+3. Run base → ensemble → Bayesian → DRL (if enabled) → calibrate → conformal.
+4. Persist: predictions, intervals, SHAP, drivers.
+5. Cache for UI/API; emit snapshot.
+
+## 7.3 Caching & IDs
+
+* Key: `(season, week, game_id, feature_version_id, model_version)`.
+* Warm caches on app start; invalidate by feature delta events.
+
+---
+
+# 8) Explainability (user-visible)
+
+* **Global weekly**: “What moved the league?” (injury clusters, weather, OL injuries, rule tweaks).
+* **Team page**: SHAP top-k; trends; talent & portal deltas.
+* **Game page**: factor table with contributions (%); **counterfactual sliders** (QB out, wind +10, neutral field, rest +3, change kicker).
+* **Uncertainty**: show aleatoric vs epistemic bands; conformal coverage badge.
+* **Analogues**: k-NN on feature space to list top-N similar historical games (with outcomes).
+* **Stylistic clustering**: k-means/HDBSCAN over team archetype vectors (pace, pass rate, havoc, motion, PA).
+
+---
+
+# 9) Coaches & Scheme Intelligence
+
+* Coach priors: rolling value-added over roster; 4th-down aggression index; early-down pass over expected; motion/PA; blitz rate.
+* Coordinator changes: reset w/ shrinkage; widen predictive intervals for 2–3 weeks.
+* Visible in UI as “Coach card” with effect sizes.
+
+---
+
+# 10) Web App (local)
+
+## 10.1 Tech
+
+* Backend: FastAPI, Pydantic, Uvicorn; ONNX Runtime; job queue (in-proc) + APScheduler.
+* Frontend: Streamlit (fast path) **or** React + Vite + TanStack Query + ECharts/Plotly (pro path).
+* Notebook: launch Jupyter locally with pre-mounted data.
+
+## 10.2 Pages
+
+* **Dashboard**: weekly predictions + intervals; upset radar; model health.
+* **Teams**: win/playoff/bowl projections; talent & portal; unit grades; stylistic cluster.
+* **Games**: probability + margin dist; drivers; counterfactuals; historical analogues.
+* **Special Teams**: FG tables, return efficiency, ST-EPA impacts.
+* **Analyst Tools**: notebook launcher; **custom metric builder** (DSL or YAML to define transforms); export CSV/Excel; **collaborative annotations** (local file or sqlite).
+* **Calibration**: reliability curves, Brier/LogLoss vs baselines; drift over weeks.
+
+---
+
+# 11) Local API (expanded)
+
+Base: `http://localhost:8787`
+
+* `GET /health`
+* `POST /update` `{sources:[...]}`
+* `GET /teams?league=NFL|NCAA&season=2025`
+* `GET /games?league=...&season=...&week=...`
+* `GET /predict/game/{game_id}` → `{p_home, p_away, margin:{mu,sigma}, intervals:{p80:[a,b]}, version, drivers:[...]}`
+* `GET /explain/game/{game_id}` → SHAP factors, text rationale
+* `POST /counterfactual` `{game_id, deltas:{QB_out:true, wind:12, neutral:true, kicker_change:true}}`
+* `GET /players/{player_id}/projections` → per-game & rolling metrics
+* `GET /specialteams/summary?team_id=...&season=...`
+* `GET /talent/{team_id}?season=...`
+* `GET /momentum/{game_id}` → ΔWP curve & impact events
+* `GET /historical/analogues?game_id=...&k=10`
+* `GET /compare/teams?team_a=...&team_b=...&season=...`
+* `GET /calibration/weekly` → buckets, Brier, ECE
+* `GET /export/{what}` → CSV/XLSX dump
+
+**Contracts**: Pydantic models; semantic versions: `model_semver`, `feature_version_id`, `data_pack_id`.
+
+---
+
+# 12) Automation & Ops
+
+* **Feature versioning**: hash inputs + code → `feature_version_id`.
+* **A/B infra**: run feature/model variants on identical weeks; compare LogLoss/Brier/ECE; auto-report.
+* **Feature importance tracking**: SHAP/GBDT importances logged weekly; drift alarms.
+* Data validation: Great Expectations suites on silver/gold.
+* Observability: structured logs (loguru), job dashboard (UI), JSON export.
+
+---
+
+# 13) Packaging & Reproducibility
+
+* Python 3.11+, `uv` or `poetry`.
+* Models: PyTorch → **ONNX** for CPU inference.
+* **Snapshot packs** per week:
+
+  ```
+  snapshots/packs/2025wk03/
+    models/*.onnx
+    calibrator.pkl
+    conformal.json
+    gold/feature_store/<feature_version_id>/*.parquet
+    config.yaml
+    manifest.json   # hashes, versions
+  ```
+* Distribution: Docker (CPU), or pip wheel (`grid` CLI).
+* No telemetry by default.
+
+---
+
+# 14) Testing & QA (executable checklist)
+
+**Unit**
+
+* Connectors (schema & type checks).
+* Feature builders: garbage-time flags; leverage; ST features; player EPA.
+* Models: shape/grad; loss; conformal set returns coverage in toy data.
+* DRL bounds: action clamp; no shift > configured limit.
+
+**Integration**
+
+* “Week sim” E2E: ingest → features → predict → explain → export.
+* Schema drift alarms trigger on column add/remove.
+* UI loads every page with demo data.
+
+**Backtests**
+
+* Rolling 5-year; artifact CSV of predictions; reliability plots; coverage plots.
+* Compare vs baselines; export PDF/HTML report.
+
+**Acceptance (POC→Promote)**
+
+* NFL+FBS, player-level & ST integrated; garbage time filtered metrics.
+* Full weekly run < **30s** on 8-core CPU.
+* Beats Elo by ≥ **2% LogLoss**; **ECE ≤ 0.03**; **90% conformal coverage 88–92%**.
+* Explanations for 100% games; counterfactuals < **500ms**.
+
+---
+
+# 15) Governance & Risk
+
+* **Overfitting**: strict time splits; ensemble simplex; cap text weight; regularize momentum.
+* **College**: FCS = exclude or separate head; conference realignment table; style heterogeneity → per-conference adapters.
+* **NFL**: Thu/international flags; rule-change annotations per season.
+* **Causal skepticism**: travel/jet-lag/weather gated by calibration audits.
+* **Licensing/ToS**: store derived features from news; link provenance.
+
+---
+
+# 16) Roadmap & Priorities
+
+**Moved up (do first)**
+
+1. **Player-level** (efficiency, matchups, aging).
+2. **Special teams** (FG model, returns, ST-EPA).
+3. **Garbage-time** filtering (affects all efficiency).
+
+**Near-term**: talent index, transfer portal, ref crews.
+**Mid-term**: PBP transformer; analogues finder; stylistic clustering.
+**Long-term**: GNN; college CV formation/coverage; injury risk priors.
+
+---
+
+# 17) Config (authoritative)
+
+`config.yaml`
+
+```yaml
+app:
+  port: 8787
+  data_dir: ./data
+  leagues: [NFL, NCAA]
+  model_version_pin: null
+data:
+  update_intervals:
+    stats: "0 6 * * 2"
+    news: "*/60 * * * *"
+    weather: "0 */6 * * *"
+features:
+  windows: [1,3,5]
+  opponent_adjust: true
+  enable_player_level: true
+  enable_special_teams: true
+  enable_garbage_time_filter: true
+  garbage_time_thresholds:
+    nfl: {q1:28, q2:28, q3:21, q4:17}
+    ncaa: {q1:35, q2:35, q3:28, q4:24}
+  leverage_smoothing_alpha: 0.3
+models:
+  use_text: true
+  use_gnn: false
+  pbp_transformer: {enabled: true, d_model: 256, layers: 3, heads: 8, seq_len: 200}
+  calibrator: "isotonic"
+  drl:
+    enabled: true
+    max_adjust_pct: 0.08
+    algo: "ppo"
+uncertainty:
+  deep_ensembles: 5
+  conformal: {levels: [0.8, 0.9]}
+serving:
+  onnx: true
+  batch_cache: true
+privacy:
+  telemetry_opt_in: false
+```
+
+`.env`
+
+```
+CFBD_API_KEY=...
+WEATHER_API_KEY=...
+NEWS_FEEDS=https://...;https://...
+```
+
+---
+
+# 18) API Contracts (examples)
+
+**GET /predict/game/{game\_id}**
+
+```json
+{
+  "game_id": "NFL_2025_W03_BUF_MIA",
+  "version": "v2025.09.wk03",
+  "feature_version_id": "fv_2025wk03_ab12",
+  "p_home": 0.61,
+  "p_away": 0.39,
+  "margin": {"mu": 3.8, "sigma": 7.2},
+  "conformal": {"p80": [0.52, 0.68], "p90": [0.49, 0.71]},
+  "drivers": [
+    {"name":"QB_health","contrib":0.12},
+    {"name":"OL_continuity","contrib":0.07},
+    {"name":"def_EPA","contrib":0.05},
+    {"name":"weather_wind","contrib":-0.03}
+  ],
+  "generated_at": "2025-09-10T12:00:03Z"
+}
+```
+
+**POST /counterfactual**
+
+```json
+{
+  "game_id":"NCAA_2025_W04_OSU_PSU",
+  "deltas":{"QB_out":true,"wind":12,"neutral_field":true,"kicker_change":true}
+}
+```
+
+→ Returns same schema + `deltas_applied`.
+
+---
+
+# 19) Dev Layout
+
+```
+repo/
+  grid/
+    api/            # FastAPI routers/schemas
+    data/           # connectors, validators
+    features/       # team, player, st, situational, talent
+    models/         # tabular, transformer, gnn, ensemble, calibrator
+    drl/            # ppo policy, env, clamps
+    uncertainty/    # ensembles, conformal
+    explain/        # shap, text rationales, counterfactuals
+    serving/        # onnx runtime, caches
+    analyst_tools/  # analogues, clustering, metric builder
+    utils/
+  ui/               # streamlit or react
+  tests/            # unit + integration
+  notebooks/        # exploration only
+  configs/
+  snapshots/
+```
+
+---
+
+# 20) Implementation Order (step-by-step)
+
+1. **Silver schemas + loaders** → unit tests for types/constraints.
+2. **Garbage-time flags + core team/unit features** → Elo baseline in UI.
+3. **Player-level features** (EPA, matchups, aging) → integrate to DL tabular.
+4. **Special teams module** → FG model + returns + ST-EPA.
+5. **Recruiting/talent + portal + ref crews** → add to features.
+6. **Meta-ensemble + calibration** → pass promotion gates.
+7. **PBP Transformer** (pretrain → game features) → blend into ensemble.
+8. **Conformal prediction** → intervals in UI; coverage tests.
+9. **DRL weighter** (offline A/B) → enable with clamps.
+10. **Analyst tools**: analogues, clustering, metric builder; exports.
+11. **Benchmarks + user study** → finalize POC; ship snapshot packs.
+
+---
+
+# 21) POC Definition (must meet)
+
+* End-to-end weekly run with **player-level**, **special teams**, **garbage-time**.
+* Beats Elo by ≥2% LogLoss; **ECE ≤ 0.03**; conformal 90% coverage within 88–92%.
+* Benchmarked vs public baselines; **analyst feedback** collected.
+* UI pages complete; counterfactuals near-instant; exports working.
+* Snapshots reproducible; model card + lineage.
+
+---
+
+# 22) Known Traps & Mitigations
+
+* **Player data gaps (college)** → hierarchical shrinkage; minimum snaps cutoff.
+* **ST sparsity** → pool by distance bins/weather; Bayesian priors for kickers.
+* **Recruiting inflation** → z-score per season; decay over years; cap weight.
+* **Momentum overfit** → cap contribution; validate via out-of-time deltas.
+* **Conference realignment** → maintain mapping table; break time series at changes.
+* **Thursday/international** → separate priors and calibration buckets.
+* **Rule changes** → season dummies; re-train EP model.
+
