@@ -101,9 +101,55 @@ class GridConfig(BaseModel):
 
 class Settings(BaseSettings):
     """Environment settings."""
+    # Core APIs
     cfbd_api_key: Optional[str] = None
+    espn_api_key: Optional[str] = None
+    
+    # Weather APIs
     weather_api_key: Optional[str] = None
+    weatherapi_key: Optional[str] = None
+    
+    # Player & Recruiting
+    recruiting_247_api_key: Optional[str] = None
+    recruiting_rivals_api_key: Optional[str] = None
+    pfr_api_key: Optional[str] = None
+    
+    # Injury & Transactions
+    espn_injury_api_key: Optional[str] = None
+    fantasypros_api_key: Optional[str] = None
+    
+    # Market Data
+    odds_api_key: Optional[str] = None
+    fanduel_api_key: Optional[str] = None
+    draftkings_api_key: Optional[str] = None
+    
+    # News & Media
     news_feeds: Optional[str] = None
+    news_api_key: Optional[str] = None
+    twitter_bearer_token: Optional[str] = None
+    
+    # Officials & Advanced Analytics
+    fo_api_key: Optional[str] = None
+    pff_api_key: Optional[str] = None
+    sis_api_key: Optional[str] = None
+    
+    # Venue & Travel
+    google_maps_api_key: Optional[str] = None
+    timezone_api_key: Optional[str] = None
+    
+    # Database & Storage
+    database_url: Optional[str] = "sqlite:///./data/grid.db"
+    redis_url: Optional[str] = "redis://localhost:6379"
+    
+    # Development & Monitoring
+    log_level: str = "INFO"
+    dev_mode: bool = False
+    telemetry_enabled: bool = False
+    
+    # Performance
+    global_rate_limit: int = 10
+    cache_ttl: int = 3600
+    parallel_fetching: bool = True
     
     class Config:
         env_file = ".env"

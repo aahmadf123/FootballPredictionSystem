@@ -1,0 +1,135 @@
+# Grid Football Prediction System - Environment Configuration
+# Copy this content to a .env file and fill in your API keys
+
+# ==============================================================================
+# CORE FOOTBALL DATA APIs
+# ==============================================================================
+
+# College Football Data API - Primary source for NCAA data
+# Get your free API key at: https://collegefootballdata.com/key
+CFBD_API_KEY=your_cfbd_api_key_here
+
+# ESPN API - Used for NFL data (some endpoints may require premium access)
+ESPN_API_KEY=your_espn_api_key_here
+
+# ==============================================================================
+# WEATHER APIs
+# ==============================================================================
+
+# OpenWeatherMap API - For game weather conditions
+# Get free API key at: https://openweathermap.org/api
+WEATHER_API_KEY=your_openweather_api_key_here
+
+# WeatherAPI.com - Alternative weather source
+# Get free API key at: https://www.weatherapi.com/
+WEATHERAPI_KEY=your_weatherapi_key_here
+
+# ==============================================================================
+# PLAYER & RECRUITING APIS
+# ==============================================================================
+
+# 247Sports API - For recruiting rankings (if available)
+RECRUITING_247_API_KEY=your_247sports_api_key_here
+
+# Rivals API - Alternative recruiting source
+RECRUITING_RIVALS_API_KEY=your_rivals_api_key_here
+
+# Pro Football Reference API - For historical NFL player data
+PFR_API_KEY=your_pfr_api_key_here
+
+# ==============================================================================
+# INJURY & TRANSACTION APIS
+# ==============================================================================
+
+# ESPN Injury API - For injury reports
+ESPN_INJURY_API_KEY=your_espn_injury_api_key_here
+
+# FantasyPros API - For injury/transaction data
+FANTASYPROS_API_KEY=your_fantasypros_api_key_here
+
+# ==============================================================================
+# MARKET DATA APIs
+# ==============================================================================
+
+# The Odds API - For betting lines and implied probabilities
+ODDS_API_KEY=your_odds_api_key_here
+
+# FanDuel/DraftKings APIs (if available)
+FANDUEL_API_KEY=your_fanduel_api_key_here
+DRAFTKINGS_API_KEY=your_draftkings_api_key_here
+
+# ==============================================================================
+# NEWS & MEDIA APIs
+# ==============================================================================
+
+# News RSS Feeds - Semicolon separated list of RSS URLs
+NEWS_FEEDS=https://www.espn.com/espn/rss/news;https://www.cbssports.com/rss/headlines/college-football;https://www.si.com/rss/si_topstories.rss;https://bleacherreport.com/articles/feed?tag_id=17
+
+# NewsAPI.org - For structured news data
+NEWS_API_KEY=your_newsapi_key_here
+
+# Twitter API v2 - For social sentiment (optional)
+TWITTER_BEARER_TOKEN=your_twitter_bearer_token_here
+
+# ==============================================================================
+# REFEREE & OFFICIALS DATA
+# ==============================================================================
+
+# Football Outsiders API - For referee crew data (if available)
+FO_API_KEY=your_football_outsiders_api_key_here
+
+# ==============================================================================
+# ADVANCED ANALYTICS APIs
+# ==============================================================================
+
+# Pro Football Focus API - For advanced player grades (premium)
+PFF_API_KEY=your_pff_api_key_here
+
+# Sports Info Solutions API - For advanced analytics
+SIS_API_KEY=your_sis_api_key_here
+
+# ==============================================================================
+# VENUE & TRAVEL DATA
+# ==============================================================================
+
+# Google Maps API - For travel distance calculations
+GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
+
+# TimeZone API - For timezone calculations
+TIMEZONE_API_KEY=your_timezone_api_key_here
+
+# ==============================================================================
+# DATABASE & STORAGE (Optional)
+# ==============================================================================
+
+# Database connection strings (if using external databases)
+DATABASE_URL=sqlite:///./data/grid.db
+
+# Redis URL (for caching)
+REDIS_URL=redis://localhost:6379
+
+# ==============================================================================
+# DEVELOPMENT & MONITORING
+# ==============================================================================
+
+# Log level (DEBUG, INFO, WARNING, ERROR)
+LOG_LEVEL=INFO
+
+# Enable development mode features
+DEV_MODE=false
+
+# Telemetry opt-in (for error reporting and analytics)
+TELEMETRY_ENABLED=false
+
+# ==============================================================================
+# RATE LIMITING & PERFORMANCE
+# ==============================================================================
+
+# Global rate limiting (requests per second)
+GLOBAL_RATE_LIMIT=10
+
+# Cache TTL in seconds (default 1 hour)
+CACHE_TTL=3600
+
+# Enable parallel data fetching
+PARALLEL_FETCHING=true
